@@ -9,6 +9,7 @@ import os
 import sys
 import hashlib
 import argparse
+import shutil
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
@@ -159,6 +160,136 @@ class DuplicateFinder:
 
         return {stem: files for stem, files in stem_groups.items() if len(files) > 1}
 
+    def move_duplicates(self, duplicates, destination_dir, keep_first=True, dry_run=False):
+        """
+        Move duplicate files to destination directory while preserving folder structure
+
+        Args:
+            duplicates: Dictionary of duplicate groups from find_duplicates_* methods
+            destination_dir: Path to destination directory for moved duplicates
+            keep_first: If True, keep the first file in each group and move the rest
+            dry_run: If True, only show what would be moved without actually moving
+
+        Returns:
+            Dictionary with move statistics and any errors
+        """
+        destination = Path(destination_dir)
+        stats = {
+            'moved_files': 0,
+            'created_dirs': 0,
+            'errors': [],
+            'total_space_freed': 0,
+            'moved_groups': 0
+        }
+
+        if not dry_run and not destination.exists():
+            try:
+                destination.mkdir(parents=True, exist_ok=True)
+                stats['created_dirs'] += 1
+                print(f"Created destination directory: {destination}")
+            except OSError as e:
+                stats['errors'].append(f"Could not create destination directory {destination}: {e}")
+                return stats
+
+        print(f"\n{'DRY RUN: ' if dry_run else ''}Moving duplicate files...")
+        print(f"Destination: {destination.absolute()}")
+        print(f"Strategy: {'Keep first file' if keep_first else 'Move all files'}")
+
+        for group_key, files in duplicates.items():
+            if len(files) < 2:
+                continue
+
+            stats['moved_groups'] += 1
+            files_to_move = files[1:] if keep_first else files
+
+            print(f"\nProcessing duplicate group: {group_key}")
+            if keep_first and len(files) > 1:
+                print(f"  Keeping: {files[0].path}")
+
+            for file_info in files_to_move:
+                try:
+                    moved_successfully = self._move_single_file(
+                        file_info, destination, dry_run, stats
+                    )
+                    if moved_successfully:
+                        stats['moved_files'] += 1
+                        stats['total_space_freed'] += file_info.size
+
+                except Exception as e:
+                    error_msg = f"Error moving {file_info.path}: {e}"
+                    stats['errors'].append(error_msg)
+                    print(f"  ERROR: {error_msg}")
+
+        return stats
+
+    def _move_single_file(self, file_info, destination_root, dry_run, stats):
+        """
+        Move a single file while preserving its directory structure
+
+        Args:
+            file_info: FileInfo object of file to move
+            destination_root: Root destination directory
+            dry_run: If True, only simulate the move
+            stats: Statistics dictionary to update
+
+        Returns:
+            True if file was moved successfully, False otherwise
+        """
+        source_path = file_info.path.absolute()
+
+        # Get the relative path from the file's original location
+        # This preserves the folder structure
+        try:
+            # Try to get relative path from current working directory
+            relative_path = source_path.relative_to(Path.cwd())
+        except ValueError:
+            # If file is outside current directory, use just the filename
+            relative_path = source_path.name
+
+        destination_path = destination_root / relative_path
+
+        print(f"  {'[DRY RUN] ' if dry_run else ''}Moving: {source_path}")
+        print(f"    -> {destination_path}")
+
+        if dry_run:
+            return True
+
+        # Create destination directory if it doesn't exist
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Handle filename conflicts
+        if destination_path.exists():
+            destination_path = self._get_unique_filename(destination_path)
+            print(f"    Renamed to avoid conflict: {destination_path.name}")
+
+        try:
+            shutil.move(str(source_path), str(destination_path))
+            return True
+        except (OSError, IOError) as e:
+            raise Exception(f"Could not move file: {e}")
+
+    def _get_unique_filename(self, file_path):
+        """
+        Generate a unique filename by appending a number if the file already exists
+
+        Args:
+            file_path: Path object of the target file
+
+        Returns:
+            Path object with unique filename
+        """
+        base_path = file_path.parent
+        stem = file_path.stem
+        suffix = file_path.suffix
+        counter = 1
+
+        while file_path.exists():
+            new_name = f"{stem}_{counter}{suffix}"
+            file_path = base_path / new_name
+            counter += 1
+
+        return file_path
+
 
 def format_file_size(size_bytes):
     """Convert bytes to human readable format"""
@@ -229,6 +360,9 @@ Examples:
   %(prog)s /path/to/directory --by-size --by-name
   %(prog)s /path/to/directory --by-content --types .jpg .png .gif
   %(prog)s /path/to/directory --all --no-recursive
+  %(prog)s /path/to/directory --by-content --move-to ./duplicates
+  %(prog)s /path/to/directory --by-content --move-to ./duplicates --dry-run
+  %(prog)s /path/to/directory --by-content --move-to ./duplicates --move-all
         """
     )
 
@@ -280,6 +414,24 @@ Examples:
         help="Don't scan subdirectories recursively"
     )
 
+    parser.add_argument(
+        "--move-to",
+        metavar="DIR",
+        help="Move duplicate files to specified directory (preserving folder structure)"
+    )
+
+    parser.add_argument(
+        "--move-all",
+        action="store_true",
+        help="Move all duplicate files (default: keep first file in each group)"
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be moved without actually moving files"
+    )
+
     args = parser.parse_args()
 
     # If no specific method is chosen, default to content-based detection
@@ -307,21 +459,58 @@ Examples:
         return
 
     # Find duplicates based on selected criteria
+    all_duplicates = {}
+
     if args.all or args.by_content:
         duplicates = finder.find_duplicates_by_content()
         display_duplicates(duplicates, "DUPLICATES BY CONTENT", show_hash=True)
+        if args.move_to:
+            all_duplicates.update(duplicates)
 
     if args.all or args.by_size:
         duplicates = finder.find_duplicates_by_size()
         display_duplicates(duplicates, "DUPLICATES BY SIZE")
+        if args.move_to and not args.by_content:  # Avoid duplicate moves
+            all_duplicates.update(duplicates)
 
     if args.all or args.by_name:
         duplicates = finder.find_duplicates_by_name()
         display_duplicates(duplicates, "DUPLICATES BY FILENAME")
+        if args.move_to and not (args.by_content or args.by_size):
+            all_duplicates.update(duplicates)
 
     if args.all or args.by_stem:
         duplicates = finder.find_duplicates_by_stem()
         display_duplicates(duplicates, "DUPLICATES BY FILENAME (without extension)")
+        if args.move_to and not (args.by_content or args.by_size or args.by_name):
+            all_duplicates.update(duplicates)
+
+    # Move duplicates if requested
+    if args.move_to and all_duplicates:
+        print(f"\n{'='*60}")
+        print("MOVING DUPLICATE FILES")
+        print(f"{'='*60}")
+
+        move_stats = finder.move_duplicates(
+            all_duplicates,
+            args.move_to,
+            keep_first=not args.move_all,
+            dry_run=args.dry_run
+        )
+
+        print(f"\n{'='*60}")
+        print("MOVE OPERATION SUMMARY")
+        print(f"{'='*60}")
+        print(f"Duplicate groups processed: {move_stats['moved_groups']}")
+        print(f"Files moved: {move_stats['moved_files']}")
+        print(f"Space freed: {format_file_size(move_stats['total_space_freed'])}")
+
+        if move_stats['errors']:
+            print(f"\nErrors encountered ({len(move_stats['errors'])}):")
+            for error in move_stats['errors']:
+                print(f"  - {error}")
+    elif args.move_to:
+        print("\nNo duplicate files found to move.")
 
 
 if __name__ == "__main__":
